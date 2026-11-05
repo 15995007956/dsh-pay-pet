@@ -1,0 +1,30 @@
+{
+  "name": "dsh-session-bridge-pet",
+  "version": "0.1.0",
+  "description": "把 DSH 会话状态（running / completionUnread / pendingInteraction）推给本地桌宠；桌面宠物专用，纯本地回环",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-session"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ]
+}

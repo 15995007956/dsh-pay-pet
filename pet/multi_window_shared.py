@@ -110,13 +110,21 @@ class MultiWindowProxy:
         return bool(self._visible_windows())
 
     # ---- 呈现扇出（只发给可见窗）----
-    def show_bubble(self, text: str, duration_ms: int = 4500) -> None:
+    def show_bubble(self, text: str, duration_ms: int = 4500, **kwargs) -> bool:
         # 联动气泡只发首个可见窗（与 show_alert 同策）：多窗同弹一条过程汇报
         # 既吵又重复，单窗展示即可；隐藏窗不弹的语义保持不变。
+        # **kwargs 原样透传（sticky 等，本地补丁：完成提示常驻）；旧窗口签名
+        # 不接受时退回纯参数调用，绝不因签名差异丢气泡。
         for w in self._visible_windows():
-            if hasattr(w, "show_bubble"):
-                w.show_bubble(text, duration_ms=duration_ms)
-                return
+            show = getattr(w, "show_bubble", None)
+            if not callable(show):
+                continue
+            try:
+                return bool(show(text, duration_ms=duration_ms, **kwargs))
+            except TypeError:
+                show(text, duration_ms=duration_ms)
+                return True
+        return False
 
     # ---- 提醒扇出（交互式提醒：审批/问题/控制级 Watchdog）----
     def show_alert(self, text: str, *, subtitle: str = "", duration_ms: int = 0,

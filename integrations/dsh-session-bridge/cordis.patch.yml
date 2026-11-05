@@ -1,0 +1,4 @@
+# dsh-session-bridge：client 半负责把会话状态推给桌宠；host 半是空壳（仅为让 bundle 可挂载）。
+- insert:
+    - id: dsh-session-bridge-pet
+      name: 'dsh-session-bridge-pet'

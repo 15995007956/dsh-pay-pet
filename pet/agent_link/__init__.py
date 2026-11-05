@@ -41,6 +41,7 @@ from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
 from . import cost as agent_cost_mod
+from .session_api import SessionApiReceiver
 from .. import harness_launcher
 from ..click_sound import play_sound, resolve_builtin_sound
 from ..agent_event_protocol import parse_agent_event
@@ -3370,6 +3371,8 @@ class AgentLinkManager(QObject):
         # 审批/问题交互必然失效（DSH 漏发 resolved 的异常场景），据此清掉，
         # 防止真实异常也留下永久弹窗。
         self.monitors["dsh"].raw_record.connect(self._on_interaction_lifecycle)
+        # 计划模式：exit_plan_mode 会阻塞等确认，但桥接不写审批事件（本地补丁）
+        self.monitors["dsh"].raw_record.connect(self._on_plan_watch)
         # 会话元数据缓存：sessionId → { sessionName, projectName, agentName }
         # 走有界写入（缺陷 23：key 是外部会话 ID，此前只增不减）
         self._session_meta_cache: dict[str, dict] = {}
@@ -3487,6 +3490,118 @@ class AgentLinkManager(QObject):
                     # 一起清。复用 offline 收敛管线：岛状态点复位（AppShell 转发）
                     # 与常驻交互气泡一并收口，与"探测到 DSH 离线"同一路径。
                     self._on_dsh_converged_state("", "offline", "link-disabled")
+
+        # 本地回环会话接收器：DSH client 插件（dsh-session-bridge-pet）把渲染层
+        # 的 sessionStatus 推过来，启用时这套提示不依赖桥接插件与文件事件流。
+        self._ensure_session_api(
+            bool(agent_cfg.get("session_api", True)),
+            int(agent_cfg.get("session_api_port") or 8765),
+        )
+
+    def _ensure_session_api(self, enabled: bool, port: int) -> None:
+        receiver = getattr(self, "_session_api", None)
+        if not enabled:
+            if receiver is not None:
+                receiver.stop()
+                self._session_api = None
+            return
+        if receiver is None:
+            receiver = SessionApiReceiver(self, port=port)
+            receiver.snapshot_received.connect(self._on_session_api_snapshot)
+            self._session_api = receiver
+        if not receiver.running:
+            receiver.start()
+
+    _SESSION_PENDING_TEXT = {
+        "approval": "有任务在等你批准～",
+        "plan-review": "计划提交啦，等你确认～",
+        "question": "有任务在等你回答～",
+    }
+
+    def _on_session_api_snapshot(self, payload: Any) -> None:
+        """处理 DSH client 插件送来的一份会话快照。"""
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("source") or "") == "salary":
+            # 工资播报由 DSH client 插件按时机算好推过来，桌宠只负责弹
+            text = str(payload.get("text") or "").strip()
+            if text:
+                log.info("工资播报（来自 DSH 插件）：%s", text)
+                try:
+                    self.win.show_bubble(text, duration_ms=6000)
+                except Exception:
+                    log.debug("工资气泡显示失败", exc_info=True)
+            return
+        if str(payload.get("source") or "") == "diag":
+            # client 插件的自诊断：直接落到 pet.log，出问题不用开浏览器控制台
+            log.warning("client 插件诊断：%s", json.dumps(payload, ensure_ascii=False)[:600])
+            return
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return
+        if not getattr(self, "_sessapi_seen", False):
+            self._sessapi_seen = True
+            log.info("已收到首个 DSH 会话快照（%d 个会话）", len(rows))
+        prev = getattr(self, "_sessapi_prev", None)
+        if not isinstance(prev, dict):
+            prev = {}
+        current: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("id") or "")
+            if not sid:
+                continue
+            running = bool(row.get("running"))
+            main = bool(row.get("main"))
+            unread = bool(row.get("unread"))
+            pending = str(row.get("pending") or "")
+            if pending not in self._SESSION_PENDING_TEXT:
+                pending = ""
+            title = str(row.get("title") or sid)
+            old = prev.get(sid) or {}
+            current[sid] = {"running": running, "pending": pending}
+            completed = ((old.get("running") and not running)
+                         or (unread and not main and not old.get("unread")))
+            if completed:
+                self._show_done_bubble(self._dialogue(
+                    "done.success", "任务完成啦，快去看看成果吧～"))
+            if pending and pending != old.get("pending"):
+                self._sessapi_show(sid, pending)
+            elif not pending and old.get("pending"):
+                self._sessapi_hide(sid)
+        for sid in list(prev):
+            if sid not in current:
+                self._sessapi_hide(sid)
+        self._sessapi_prev = current
+        log.debug("会话快照：%d 个会话（away=%s）", len(current), payload.get("away"))
+
+    def _sessapi_show(self, session_id: str, kind: str) -> None:
+        alert_id = f"sessapi:{session_id}:{kind}"
+        ids = getattr(self, "_sessapi_aids", None)
+        if not isinstance(ids, dict):
+            ids = self._sessapi_aids = {}
+        ids[session_id] = alert_id
+        text = self._SESSION_PENDING_TEXT.get(kind, "有任务在等你处理～")
+        try:
+            self._show_alert_compat(text, sticky=True, alert_id=alert_id,
+                                    alert_type=kind, priority=2)
+        except Exception:
+            log.debug("会话提示弹出失败", exc_info=True)
+
+    def _sessapi_hide(self, session_id: str) -> None:
+        ids = getattr(self, "_sessapi_aids", None)
+        if not isinstance(ids, dict):
+            return
+        alert_id = ids.pop(session_id, None)
+        if not alert_id:
+            return
+        resolve = getattr(self.win, "resolve_alert", None)
+        if callable(resolve):
+            try:
+                resolve(alert_id)
+            except Exception:
+                log.debug("会话提示收起失败", exc_info=True)
 
     def _install_dsh_worker(self, token: int) -> None:
         """后台线程：安装 DSH 桥接插件，完成后信号回主线程。"""
@@ -3890,6 +4005,10 @@ class AgentLinkManager(QObject):
         """
         if not self._dsh_convergence_current(gen):
             return  # 迟到/孤儿/上一代次的排队信号，见 _dsh_convergence_current
+        # 真人开新对话：撤掉常驻的完成提示（本地补丁：完成气泡改为常驻后，
+        # 只在"用户开始下一轮"时收口；不能挂在 busy 边沿上——turn/end 之后
+        # 常有一两个尾随事件把状态翻回 working，那会把刚弹的提示瞬间清掉）。
+        self._dismiss_done_bubble()
         self.dsh_user_message.emit(session_id, text)
         self.notify_dsh_state("thinking")
 
@@ -3912,6 +4031,8 @@ class AgentLinkManager(QObject):
         owner = str(payload.get("owner") or "")
         if not owner or not self._gen_current(agent_key, int(payload.get("gen") or 0)):
             return
+        # 新一轮开始：撤掉常驻的完成提示（本地补丁；真人消息/turn 起点都会走到这里）。
+        self._dismiss_done_bubble()
         # 只记分片、不动 _last_raw：聚合值由同一条记录的收敛注入负责（thinking），
         # 这里重复写会把 waiting_approval 这类锁存值顶掉。
         self._owner_seq += 1
@@ -3980,12 +4101,12 @@ class AgentLinkManager(QObject):
         # _last_raw 取折叠值：单写者 = success（与旧行为一致），还有写者忙/等待时
         # 保持原值（不切待机动画、any_busy 仍为真、空闲 FPS 门禁保持关闭）。
         self._last_raw[agent_key] = self._folded_raw_state(agent_key) or "success"
-        if agent_key not in self._done_pending:
-            self._schedule_done_check(agent_key, cause="success", owner=owner)
-        else:
-            self._done_cause[agent_key] = "success"
-            if owner:
-                self._done_owner[agent_key] = owner
+        # 本地补丁：turn/end 是权威的「回合结束」，直接弹（不排 800ms 确认）——
+        # DSH 在 turn/end 之后常有一两个尾随事件（assistant/message、step/end）
+        # 把状态立刻翻回 working，排定式确认会被 busy 分支的 _cancel_done_check
+        # 撤掉，用户根本看不到完成提示。force=True 跳过“回忙则作废”的判据。
+        self._cancel_done_check(agent_key)
+        self._fire_done(agent_key, None, force=True)
 
     #: 写者分片记账表（``_owner_raw``）的容量：写者数量本身由收敛器的 scope 注册表
     #: 限死（见 ``dsh_state.SCOPE_REGISTRY_MAX``），这里是第二道有界闸（覆盖多
@@ -4288,7 +4409,10 @@ class AgentLinkManager(QObject):
             # 判据按**写者归属**：失败是某一写者本轮的回合事实，只挡它自己那条
             # 收尾——A 实例的失败不得吞掉 B 实例的成功（见 _error_marked）。
             if not self._error_marked(agent_key, owner or ""):
-                self._schedule_done_check(agent_key, cause="success", owner=owner or "")
+                # 本地补丁：success 只可能来自 turn/end（回合真的结束了），直接弹
+                # 常驻提示，不再排 800ms 确认——确认窗会被紧随其后的尾随事件
+                # （assistant/message、step/end → working）撤销，提示永远看不到。
+                self._fire_done(agent_key, None, force=True)
 
         # 去抖：同一 Agent 连续相同状态只生效第一次
         last = self._last_applied.get(agent_key)
@@ -4514,10 +4638,111 @@ class AgentLinkManager(QObject):
             name=name,
         )
 
+    #: plan 模式：exit_plan_mode 会阻塞等用户确认，但桥接只写 tool/call、不写
+    #: 审批事件——用「N 秒没收到这条调用的 tool/result 就是在等确认」的启发式补提示。
+    _PLAN_TOOLS = {"exit_plan_mode", "exitplanmode", "exit_plan"}
+    _PLAN_CONFIRM_DELAY_MS = 5000
+
+    def _on_plan_watch(self, agent_key: str, record: Any) -> None:
+        if not isinstance(record, dict):
+            return
+        event = str(record.get("event") or "")
+        tool = str(record.get("tool") or "").strip().lower()
+        call_id = str(record.get("callId") or record.get("call_id") or "")
+        if event in ("tool/call", "tool/result", "turn/start"):
+            self._track_pending_tool(record, event)
+        if event == "tool/call" and tool in self._PLAN_TOOLS:
+            calls = getattr(self, "_plan_pending_call", None)
+            if calls is None:
+                calls = self._plan_pending_call = {}
+            calls[agent_key] = call_id
+            self._schedule_plan_alert(agent_key, record)
+        elif event == "tool/result":
+            # 只认这条计划调用的结果：别的工具跑完不该把计划提示撤掉
+            pending = getattr(self, "_plan_pending_call", {}).get(agent_key)
+            if not pending or not call_id or call_id == pending:
+                self._clear_plan_alert(agent_key)
+
+    def _schedule_plan_alert(self, agent_key: str, record: dict) -> None:
+        self._clear_plan_alert(agent_key, keep_call=True)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(self._PLAN_CONFIRM_DELAY_MS)
+        timer.timeout.connect(lambda: self._show_plan_alert(agent_key, record))
+        timers = getattr(self, "_plan_timers", None)
+        if timers is None:
+            timers = self._plan_timers = {}
+        timers[agent_key] = timer
+        timer.start()
+
+    def _show_plan_alert(self, agent_key: str, record: dict) -> None:
+        timers = getattr(self, "_plan_timers", {})
+        timer = timers.pop(agent_key, None)
+        if timer is not None:
+            timer.deleteLater()
+        win = getattr(self, "win", None)
+        if win is None:
+            return
+        call_id = str(record.get("callId") or record.get("call_id") or "")
+        alert_id = f"plan:{agent_key}:{call_id}"
+        ids = getattr(self, "_plan_alert_ids", None)
+        if ids is None:
+            ids = self._plan_alert_ids = {}
+        ids[agent_key] = alert_id
+        text = "计划提交啦，等你确认～"
+        show = getattr(win, "show_alert", None)
+        try:
+            if callable(show):
+                show(text, sticky=True, alert_id=alert_id, alert_type="plan",
+                     priority=2, duration_ms=0)
+            else:
+                win.show_bubble(text, duration_ms=self._DONE_BUBBLE_MS)
+        except Exception:
+            log.debug("计划确认提示失败", exc_info=True)
+        log.info("计划待确认提示已弹出（%s）", alert_id)
+
+    def _clear_plan_alert(self, agent_key: str, *, keep_call: bool = False) -> None:
+        timers = getattr(self, "_plan_timers", None)
+        if timers:
+            timer = timers.pop(agent_key, None)
+            if timer is not None:
+                timer.stop()
+                timer.deleteLater()
+        if not keep_call:
+            calls = getattr(self, "_plan_pending_call", None)
+            if calls:
+                calls.pop(agent_key, None)
+        ids = getattr(self, "_plan_alert_ids", None)
+        if ids:
+            alert_id = ids.pop(agent_key, None)
+            if alert_id:
+                win = getattr(self, "win", None)
+                resolve = getattr(win, "resolve_alert", None)
+                if callable(resolve):
+                    try:
+                        resolve(alert_id)
+                    except Exception:
+                        log.debug("计划确认提示收起失败", exc_info=True)
+
+    def _bubbles_minimal(self) -> bool:
+        """``agent_link.bubble_mode == "minimal"``：运行中不弹气泡。
+
+        只保留「完成 / 审批 / 提问（以及错误）」这几类用户需要停下来看的事件，
+        thinking / working 期间的「开始干活」「过程汇报」全部静默。默认 ``all``
+        时行为与上游一致；本键为本地补丁（不在设置页暴露），读配置即生效。
+        """
+        cfg = self.cfg.get("agent_link", {})
+        try:
+            return str((cfg or {}).get("bubble_mode", "all")).strip().lower() == "minimal"
+        except AttributeError:
+            return False
+
     def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working") -> None:
         """开始干活气泡：仅「非 busy → busy」时提示（thinking↔working 互跳不弹）。
         低优先级：气泡位被占时直接丢弃。thinking 状态用更有趣的文案。"""
         if prev_raw in self._BUSY_STATES:
+            return
+        if self._bubbles_minimal():
             return
         name = self.agent_names.get(agent_key, agent_key)
         if state == "thinking":
@@ -4532,6 +4757,8 @@ class AgentLinkManager(QObject):
         """过程汇报气泡（可选，默认关）：「DSH 正在读文件…」这类。
         白名单工具映射 + 三重限流（同 Agent 10s / 同文案 60s / 全局 8s）。"""
         if not self._gen_current(agent_key, gen):
+            return
+        if self._bubbles_minimal():
             return
         mark = getattr(self.win, "mark_activity", None)
         if callable(mark):
@@ -5047,6 +5274,8 @@ class AgentLinkManager(QObject):
           把本写者并进去，alert 身份与 owner 集合都沿用原来那份。
         """
         session_id = str(extra.get("session_id") or "")
+        # 审批/提问接管气泡位：先撤掉常驻的完成提示，避免两层气泡叠着
+        self._dismiss_done_bubble()
         existing_iid = self._existing_interaction_for(agent_key, kind, extra, session_id)
         if existing_iid is not None:
             iid = existing_iid
@@ -5168,6 +5397,7 @@ class AgentLinkManager(QObject):
 
     def dismiss_all_interactions(self) -> None:
         """清空全部待处理阻塞交互并关闭气泡（DSH 离线/重启时交互必然失效）。"""
+        self._dismiss_done_bubble()
         self._clear_model_access_alerts()
         if not self._pending_interactions and not getattr(self.win, "_sticky_bubble_active", False):
             return
@@ -5306,6 +5536,7 @@ class AgentLinkManager(QObject):
             for key in ("priority", "alert_type", "metadata"):
                 legacy.pop(key, None)
             self.win.show_alert(text, **legacy)
+        # 托盘通知已按用户要求关闭（2026-11-05）：审批/提问只走桌宠气泡。
 
     @staticmethod
     def _questions_all_have_options(questions: list) -> bool:
@@ -5431,7 +5662,8 @@ class AgentLinkManager(QObject):
         self._error_after_done.add(agent_key)
         self._cancel_done_check_for_owner(agent_key, owner)
 
-    def _fire_done(self, agent_key: str, gen: int | None = None) -> None:
+    def _fire_done(self, agent_key: str, gen: int | None = None, *,
+                   force: bool = False) -> None:
         """800ms 稳定确认到期：期间回忙则不算完成；配置/冷却在弹出前再查。
 
         ``gen`` 是这条确认**排定时**绑定的监测代次（``_schedule_done_check`` 传入，
@@ -5464,10 +5696,10 @@ class AgentLinkManager(QObject):
         # 提醒）；没有别的写者能解释的忙归当事人自己（起点记录已被
         # ``_on_dsh_turn_started`` 落成分片，剩下的是不带归属的忙注入，如 tool/call）
         # → 与"期间回忙"同等作废，别拿无人认领的忙弹完成。
-        if (owner and self._last_raw.get(agent_key) in self._BUSY_STATES
-                and not self._other_writer_busy(agent_key, owner)):
+        if not force and (owner and self._last_raw.get(agent_key) in self._BUSY_STATES
+                          and not self._other_writer_busy(agent_key, owner)):
             return
-        if context_state in self._BUSY_STATES:
+        if not force and context_state in self._BUSY_STATES:
             return
         # 防线：到期时该 agent 的**当前**原始状态已是 error（收尾后爆雷时打标路径
         # 万一漏了，或者将来新增的 error 落点忘了打标）→ 一律不许成功口径。
@@ -5486,9 +5718,9 @@ class AgentLinkManager(QObject):
         name = self.agent_names.get(agent_key, agent_key)
         if self._alert_marked(agent_key, owner) or context_state == "error":
             # busy 期间出现过 attention/error：不暗示"成功完成"
-            text = self._dialogue("done.attention", f"{name} 那边停了，结果怎么样要主人自己看一眼哦", agent_key=agent_key, name=name)
+            text = self._dialogue("done.attention", "这边停了，结果怎么样要主人自己看一眼哦", agent_key=agent_key, name=name)
         else:
-            text = self._dialogue("done.success", f"{name} 干完活啦，去看看成果吧～", agent_key=agent_key, name=name)
+            text = self._dialogue("done.success", "任务完成啦，快去看看成果吧～", agent_key=agent_key, name=name)
         self._saw_alert.discard(agent_key)
         self._mark_owner(self._owner_alert_marks, agent_key, owner, on=False)
         if hidden:
@@ -5513,7 +5745,7 @@ class AgentLinkManager(QObject):
             elif hasattr(self.win, "switch_clip") and getattr(self.win, "idles", None):
                 self.win.switch_clip(self.win.idles[0])
             self._last_applied[agent_key] = ("idle", now)
-        self._show_link_bubble(text, important=True)
+        self._show_done_bubble(text)
         self._cost_finish(agent_key)
 
     # ------------------------------------------------------------ 本轮消费
@@ -5649,14 +5881,254 @@ class AgentLinkManager(QObject):
         log.info("播放联动音效 event=%s agent=%s path=%s", event_name, agent_key, path)
         play_sound(path, volume=float(agent_cfg.get("sound_volume", 0.65)))
 
+    #: 完成提示在屏幕上停留的时长（毫秒）。用户要求：不常驻，15 秒自动消失。
+    _DONE_BUBBLE_MS = 15000
+    #: 桌宠隐藏/免打扰时延后补发的轮询间隔与最长期限。
+    _DONE_RETRY_MS = 2000
+    _DONE_PENDING_MAX_S = 600.0
+
+    def _show_done_bubble(self, text: str) -> None:
+        """完成提示：气泡 15 秒自动消失；被全屏/隐藏挡住时用系统托盘通知兜底。"""
+        if self._tools_still_running():
+            # turn/end 先到、工具还没返回（长命令/子步骤）——这不是真完成，别误报
+            log.info("完成事件到达但仍有工具调用未返回，忽略本次完成提示")
+            return
+        self._done_bubble_text = text
+        self._done_bubble_shown = True
+        shown = self._try_show_done(text)
+        fullscreen = self._foreground_is_fullscreen()
+        dsh_fg = self._dsh_in_foreground()
+        if shown:
+            self._clear_pending_done()
+            self._start_done_expire()
+            log.info("完成提示已弹出（%d 秒后自动消失）fullscreen=%s dsh_fg=%s",
+                     self._DONE_BUBBLE_MS // 1000, fullscreen, dsh_fg)
+        else:
+            # 全屏自动隐藏 / 设置页抑制 / 提醒占位：气泡不丢，恢复可见后补发；
+            # 同时先发一条托盘通知，保证“全屏看视频”时也能被提醒到。
+            self._pending_done_since = time.monotonic()
+            self._start_done_retry()
+            log.info("完成提示延后：桌宠不可见或免打扰（恢复后补发气泡）")
+
+    def _try_show_done(self, text: str) -> bool:
+        try:
+            shown = bool(self.win.show_bubble(text, duration_ms=self._DONE_BUBBLE_MS))
+        except Exception:
+            log.warning("完成提示弹出异常", exc_info=True)
+            return False
+        if shown:
+            self._raise_pet_windows()
+        return shown
+
+    def _raise_pet_windows(self) -> None:
+        """把可见的桌宠窗抬到最前（防被全屏浏览器/播放器压住）。"""
+        windows = []
+        getter = getattr(self.win, "_windows", None)
+        if callable(getter):
+            try:
+                windows = list(getter())
+            except Exception:
+                windows = []
+        for w in windows:
+            raiser = getattr(w, "raise_", None)
+            if callable(raiser):
+                try:
+                    raiser()
+                except Exception:
+                    pass
+
+    def _tray_icon(self):
+        win = getattr(self, "win", None)
+        shell = getattr(win, "_shell", None)
+        overlay = getattr(shell, "_overlay_shell", None) or shell
+        tray = getattr(overlay, "tray", None)
+        if tray is None:
+            tray = getattr(win, "tray", None)
+        return tray
+
+    def _tray_balloon(self, text: str, title: str = "任务完成") -> None:
+        """系统托盘气泡：桌宠被全屏/隐藏挡住、或 DSH 在后台时的兜底提醒。"""
+        tray = self._tray_icon()
+        if tray is None:
+            return
+        try:
+            from PySide6.QtWidgets import QSystemTrayIcon
+
+            tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
+            log.info("已发系统托盘通知：%s", title)
+        except Exception:
+            log.debug("托盘通知失败", exc_info=True)
+
+    #: 未返回的工具调用：callId → 受理时间；超过该时长视为丢弃（防泄漏）
+    _PENDING_TOOL_TTL_S = 900.0
+
+    def _track_pending_tool(self, record: dict, event: str) -> None:
+        if event == "turn/start":
+            # 新回合开始：上一回合遗留的“未返回调用”一律作废，别拖累下一轮完成提示
+            pending = getattr(self, "_pending_tools", None)
+            if pending:
+                pending.clear()
+            return
+        call_id = str(record.get("callId") or record.get("call_id") or "")
+        if not call_id:
+            return
+        pending = getattr(self, "_pending_tools", None)
+        if pending is None:
+            pending = self._pending_tools = {}
+        if event == "tool/call":
+            pending[call_id] = time.monotonic()
+        else:
+            pending.pop(call_id, None)
+
+    def _tools_still_running(self) -> bool:
+        """是否还有未返回的工具调用（turn/end 先到时的误报防线）。"""
+        pending = getattr(self, "_pending_tools", None)
+        if not pending:
+            return False
+        now = time.monotonic()
+        for call_id, started in list(pending.items()):
+            if now - started > self._PENDING_TOOL_TTL_S:
+                pending.pop(call_id, None)
+        return bool(pending)
+
+    def _foreground_process_name(self) -> str:
+        """前台窗口所属进程名（小写）；取不到返回空串。"""
+        if sys.platform != "win32":
+            return ""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ""
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return ""
+            import psutil
+
+            return psutil.Process(pid.value).name().lower()
+        except Exception:
+            return ""
+
+    def _dsh_in_foreground(self) -> bool:
+        """DSH 是否在前台（不是的话完成提示容易错过，需要托盘兜底）。"""
+        return "deepseek" in self._foreground_process_name()
+
+    def _foreground_is_fullscreen(self) -> bool:
+        """前台窗口是否铺满所在显示器（浏览器 F11/网页全屏/视频全屏都算）。"""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return False
+            mon = info.rcMonitor
+            return (rect.left <= mon.left and rect.top <= mon.top
+                    and rect.right >= mon.right and rect.bottom >= mon.bottom)
+        except Exception:
+            log.debug("全屏探测失败", exc_info=True)
+            return False
+
+    def _start_done_expire(self) -> None:
+        timer = getattr(self, "_done_expire_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._expire_done_bubble)
+            self._done_expire_timer = timer
+        timer.start(self._DONE_BUBBLE_MS)
+
+    def _start_done_retry(self) -> None:
+        timer = getattr(self, "_done_retry_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(self._DONE_RETRY_MS)
+            timer.timeout.connect(self._retry_done_bubble)
+            self._done_retry_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _retry_done_bubble(self) -> None:
+        """桌宠恢复可见后补发完成提示（超过 _DONE_PENDING_MAX_S 丢弃）。"""
+        text = getattr(self, "_done_bubble_text", "")
+        since = getattr(self, "_pending_done_since", None)
+        if not text or since is None:
+            self._stop_done_retry()
+            return
+        if time.monotonic() - since > self._DONE_PENDING_MAX_S:
+            self._clear_pending_done()
+            log.info("完成提示已过期（%d 分钟内未能显示），丢弃",
+                     int(self._DONE_PENDING_MAX_S // 60))
+            return
+        if self._try_show_done(text):
+            self._clear_pending_done()
+            self._start_done_expire()
+            log.info("完成提示补发成功（%d 秒后自动消失）", self._DONE_BUBBLE_MS // 1000)
+
+    def _clear_pending_done(self) -> None:
+        self._pending_done_since = None
+        self._stop_done_retry()
+
+    def _stop_done_retry(self) -> None:
+        timer = getattr(self, "_done_retry_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _expire_done_bubble(self) -> None:
+        """15 秒到：只清标记，不主动隐藏（气泡已按 duration 收起）。"""
+        self._done_bubble_shown = False
+
+    def _dismiss_done_bubble(self) -> None:
+        """撤掉常驻的「完成」气泡（本地补丁：完成提示改为常驻后需要收口点）。
+
+        收口时机：新回合开始（任何写者回到 busy）、审批/提问接管、联动关闭。
+        只在确认没有提醒（审批/问题）正挂时动手，绝不误清别人的气泡。
+        """
+        self._clear_pending_done()
+        if not getattr(self, "_done_bubble_shown", False):
+            return
+        self._done_bubble_shown = False
+        timer = getattr(self, "_done_expire_timer", None)
+        if timer is not None:
+            timer.stop()
+        win = getattr(self, "win", None)
+        if win is None:
+            return
+        if getattr(win, "_alert_current", None) is not None or getattr(win, "_alert_queue", None):
+            return  # 提醒正在展示：不碰它
+        try:
+            win.hide_bubble()
+        except Exception:
+            log.debug("撤下完成气泡失败", exc_info=True)
+
     def _show_link_bubble(self, text: str, *, important: bool, duration_ms: int = 4500,
-                          _retried: int = 0) -> None:
+                          sticky: bool = False, _retried: int = 0) -> bool:
         """联动气泡：提醒消息队列非空时一律让路（审批/问题/失败等常驻提醒优先）。
 
         无提醒队列时：普通气泡直接让路丢弃；重要气泡每 2.5s 重试至多 4 次
         （约 10s 窗口），仍被占才放弃——主动识屏长答复可能占位 15-20s。"""
         if not hasattr(self.win, "show_bubble"):
-            return
+            return False
         # 桌宠隐藏时 show_bubble/show_alert 会静默丢弃：改道灵动岛反馈面
         # （AppShell 经 hidden_bubble_redirect 注入；无注入/岛不可用维持丢弃）。
         # 审批/问题等常驻提示气泡不经本函数（走 show_alert 队列），仍需桌宠可见。
@@ -5665,14 +6137,14 @@ class AgentLinkManager(QObject):
             from .. import window_alerts as _window_alerts
 
             if _window_alerts.redirect_hidden_bubble(self.win, text, duration_ms=duration_ms):
-                return
+                return False
         # 提醒消息队列激活：任何其他弹窗（含重要气泡）都不覆盖提醒
         if getattr(self.win, "_alert_current", None) is not None or \
                 getattr(self.win, "_alert_queue", None):
-            return
+            return False
         if not important and getattr(self.win, "_sticky_bubble_active", False):
             # 兼容旧路径：审批等一直挂着的气泡优先
-            return
+            return False
         busy_until = getattr(self.win, "_bubble_busy_until", 0.0)
         # window.hold_bubble 以 time.monotonic() 写入 _bubble_busy_until，这里必须
         # 用同一时钟域比较——曾误用 time.time()（epoch 秒），在真实桌宠上恒判
@@ -5680,12 +6152,18 @@ class AgentLinkManager(QObject):
         # 重试直接覆盖）。同步修正于 PR57 合并后审计（F1）。
         if time.monotonic() < busy_until:
             if not important or _retried >= 4:
-                return
+                return False
             QTimer.singleShot(2500, self,
                               lambda t=text, n=_retried: self._show_link_bubble(
                                   t, important=True, _retried=n + 1))
-            return
-        self.win.show_bubble(text, duration_ms=duration_ms)
+            return False
+        if sticky:
+            try:
+                return bool(self.win.show_bubble(text, duration_ms=duration_ms, sticky=True))
+            except TypeError:
+                # 旧宿主没有 sticky 参数：退回普通气泡，至少别丢提醒
+                return bool(self.win.show_bubble(text, duration_ms=duration_ms))
+        return bool(self.win.show_bubble(text, duration_ms=duration_ms))
 
     # 阻塞交互兜底清理（approval / question / cordis 共用）。
     # 审批/问题等待期间 Agent 不会走到 turn/end（DSH 仍处于 running）；

@@ -237,6 +237,19 @@ def _clean_quick_launch_apps(value):
     return cleaned
 
 
+def _default_salary_widget_data() -> dict:
+    """打工人小部件默认参数（与「打工人小部件」需求文档一致）。"""
+    return {
+        "enabled": True,
+        "monthlySalary": 10000.0,
+        "monthlyConsumption": 5000.0,
+        "workStart": "08:00",
+        "workEnd": "18:00",
+        "min_interval_minutes": 20,
+        "max_interval_minutes": 45,
+    }
+
+
 def _default_proactive_screen_data() -> dict:
     return {
         "enabled": False,
@@ -262,6 +275,10 @@ def _default_agent_link_data() -> dict:
         "claude": False,
         "cursor": False,
         "opencode": False,
+        # 本地回环会话接收器：配合 DSH client 插件 dsh-session-bridge-pet，
+        # 直接用渲染层的 sessionStatus 做完成/审批/计划提示（不依赖桥接插件）。
+        "session_api": True,
+        "session_api_port": 8765,
         # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
         # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
         "custom_agents": [],
@@ -367,6 +384,7 @@ def _clean_agent_link_data(raw: Any) -> dict:
         "claude",
         "cursor",
         "opencode",
+        "session_api",
         "sound_enabled",
         "sound_start_enabled",
         "sound_done_enabled",
@@ -380,6 +398,11 @@ def _clean_agent_link_data(raw: Any) -> dict:
             result[key] = val or defaults[key]
     if "sound_volume" in raw:
         result["sound_volume"] = _float_or_default(raw.get("sound_volume"), defaults["sound_volume"], 0.0, 1.0)
+    if "session_api_port" in raw:
+        try:
+            result["session_api_port"] = max(1024, min(65535, int(raw.get("session_api_port"))))
+        except (TypeError, ValueError):
+            pass
     if "sound_cooldown_seconds" in raw:
         result["sound_cooldown_seconds"] = _float_or_default(raw.get("sound_cooldown_seconds"), defaults["sound_cooldown_seconds"], 0.0, 30.0)
     # 减法后退役的键（概率门 / 卡住检测 / 行为模式 / 探索看门狗，含它们的旧
@@ -1282,6 +1305,7 @@ class Config:
             "network_probe_interval_seconds": 1.0,
             # 右键菜单「网络信息」入口显隐（弹窗只在打开时取一次数据，不轮询）。
             "network_info_menu_enabled": True,
+            "salary_widget": _default_salary_widget_data(),
             "proactive_screen": _default_proactive_screen_data(),
             "agent_link": _default_agent_link_data(),
             "file_interpret": _default_file_interpret_data(),

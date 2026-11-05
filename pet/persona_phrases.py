@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from string import Formatter
 from typing import Any, Mapping
+import random
 import re
 
 class _TemplateObject(dict):
@@ -240,6 +241,27 @@ class PhrasePicker:
     def __init__(self) -> None:
         self._last: dict[str, int] = defaultdict(lambda: -1)
 
+    def _pick_variant_index(self, key: str, count: int) -> int:
+        """随机抽一个变体，且不与上一条相同（count > 1 时）。
+
+        用户要求：「每次抽签，但别连着两次同一句」。实现上从「除上一次之外」的
+        count-1 个候选里均匀抽——比「抽到重复就重抽」少一次随机、分布也更均匀。
+        """
+        if count <= 0:
+            return 0
+        if count == 1:
+            self._last[key] = 0
+            return 0
+        last = self._last[key]
+        if 0 <= last < count:
+            idx = random.randrange(count - 1)
+            if idx >= last:
+                idx += 1
+        else:
+            idx = random.randrange(count)
+        self._last[key] = idx
+        return idx
+
     def get(self, mode: str, key: str, fallback: str, autohide=None, **values) -> str:
         """Render a built-in preset phrase (legacy / whale_maid) for an event.
 
@@ -251,9 +273,7 @@ class PhrasePicker:
             return fallback
         if isinstance(variants, str):
             variants = [variants]
-        last = self._last[key]
-        index = (last + 1) % len(variants)
-        self._last[key] = index
+        index = self._pick_variant_index(key, len(variants))
         try:
             return render_template(variants[index], values, autohide=autohide)
         except (KeyError, ValueError):
@@ -276,9 +296,7 @@ class PhrasePicker:
             variants = [str(raw).strip()] if isinstance(raw, str) and raw.strip() else []
         if not variants:
             return fallback
-        last = self._last[key]
-        index = (last + 1) % len(variants)
-        self._last[key] = index
+        index = self._pick_variant_index(key, len(variants))
         return render_template(variants[index], values, autohide=autohide)
 
     def custom_for_agent(self, phrases: Mapping[str, Any] | None, route_agent: str, key: str,
@@ -300,9 +318,7 @@ class PhrasePicker:
             variants = [str(raw).strip()] if isinstance(raw, str) and raw.strip() else []
         if not variants:
             return fallback
-        last = self._last[key]
-        index = (last + 1) % len(variants)
-        self._last[key] = index
+        index = self._pick_variant_index(key, len(variants))
         return render_template(variants[index], values, autohide=autohide)
 
 
