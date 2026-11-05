@@ -1,5 +1,18 @@
 # dsh-pet-indesktop
 
+> **本仓库是 [MerZlin/dsh-pet-indesktop](https://github.com/MerZlin/dsh-pet-indesktop) 的 fork，改名 `dsh-pay-pet`。**
+>
+> 在桌宠本体之上加了两块东西：
+> - **DSH 联动改用 client 插件**：直接读 `sessions.list` / `uiSession.sessionStatus`，
+>   原生识别审批、计划审阅（plan-review）、提问、完成，不再依赖文件桥接与轮询；
+> - **工资播报**：按 21.75 月计薪天数的口径，在桌宠气泡里随机播报「今日已赚 / 今日净赚」。
+>
+> 改动清单、架构、安装步骤、许可与素材限制见 **[FORK-NOTES.md](FORK-NOTES.md)**。
+>
+> ⚠️ `assets/characters/**` 是 CC BY-NC-SA 类同人素材（角色「溟月」，画师上善无形），
+> **仅限个人非商业使用**。商用请自行替换素材。
+
+
 <p align="center">
   <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="版本" src="https://img.shields.io/github/v/release/MerZlin/dsh-pet-indesktop?label=%E7%89%88%E6%9C%AC&color=blue"></a>
   <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="总下载" src="https://img.shields.io/github/downloads/MerZlin/dsh-pet-indesktop/total?label=%E6%80%BB%E4%B8%8B%E8%BD%BD&color=brightgreen"></a>
