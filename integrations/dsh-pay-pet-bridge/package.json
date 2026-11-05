@@ -1,7 +1,7 @@
 {
-  "name": "dsh-session-bridge-pet",
+  "name": "dsh-pay-pet-bridge",
   "version": "0.1.0",
-  "description": "把 DSH 会话状态（running / completionUnread / pendingInteraction）推给本地桌宠；桌面宠物专用，纯本地回环",
+  "description": "DSH 桌宠（dsh-pay-pet）的联动桥：把会话状态与工资播报推给本地桌宠",
   "type": "module",
   "license": "MIT",
   "main": "index.js",

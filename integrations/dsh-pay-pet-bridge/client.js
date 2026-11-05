@@ -1,4 +1,4 @@
-// dsh-session-bridge（client 半）
+// dsh-pay-pet-bridge（client 半）
 //
 // 运行在 DSH 页面里，读取渲染层的会话状态并 POST 给桌宠：
 //   sessions.list          → running / completionUnread / retainedBy.mainView
@@ -169,7 +169,7 @@
               pending: (entry && entry.pendingInteraction && entry.pendingInteraction.kind) || null,
             };
           });
-          post({ source: "dsh-session-bridge-pet", ts: Date.now(), away: awayNow(), rows });
+          post({ source: "dsh-pay-pet-bridge", ts: Date.now(), away: awayNow(), rows });
         } catch (e) {
           diag("snapshot-error", { message: String(e) });
         }
@@ -178,7 +178,7 @@
       if (sessions && sessions.list && typeof sessions.list.subscribe === "function") {
         listDispose = sessions.list.subscribe(() => snapshot());
         try {
-          ctx.effect(() => listDispose, "dsh-session-bridge-pet: session list");
+          ctx.effect(() => listDispose, "dsh-pay-pet-bridge: session list");
         } catch (e) {
           diag("effect-error", { message: String(e) });
         }
@@ -196,7 +196,7 @@
               status = feed.getSnapshot();
               snapshot();
             });
-            uiCtx.effect(() => dispose, "dsh-session-bridge-pet: session status");
+            uiCtx.effect(() => dispose, "dsh-pay-pet-bridge: session status");
             diag("uiSession-ready");
             snapshot();
           } catch (e) {
@@ -212,7 +212,7 @@
         ctx.effect(() => () => {
           if (timer !== null) clearInterval(timer);
           timer = null;
-        }, "dsh-session-bridge-pet: heartbeat");
+        }, "dsh-pay-pet-bridge: heartbeat");
       } catch (e) {
         diag("effect-error", { message: String(e) });
       }
@@ -231,7 +231,7 @@
   apply.inject = ["sessions"];
 
   window.__ModuleLoader__.load({
-    id: "dsh-session-bridge-pet",
+    id: "dsh-pay-pet-bridge",
     factory: (require) => {
       var module = { exports: {} };
       module.exports = apply;

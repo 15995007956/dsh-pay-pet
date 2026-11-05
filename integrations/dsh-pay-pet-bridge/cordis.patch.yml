@@ -1,0 +1,4 @@
+# dsh-pay-pet-bridge：client 半把会话状态与工资播报推给桌宠；host 半是空壳（仅为让 bundle 可挂载）。
+- insert:
+    - id: dsh-pay-pet-bridge
+      name: 'dsh-pay-pet-bridge'

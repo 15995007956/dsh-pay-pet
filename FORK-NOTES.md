@@ -1,4 +1,4 @@
-# 本 Fork 的改动说明
+# dsh-pay-pet · 本 Fork 的改动说明
 
 上游仓库：[Merzlin/dsh-pet-indesktop](https://github.com/Merzlin/dsh-pet-indesktop)（MIT）
 
@@ -14,7 +14,7 @@
 |---|---|
 | `pet/agent_link/session_api.py` | 本地回环 HTTP 接收器（`127.0.0.1:8765`），收 DSH client 插件推来的会话快照与工资播报；另提供 `GET /salary-config` |
 | `pet/salary_widget.py` | 工资计算（21.75 月计薪天数 / 上班窗口内累计 / 净时薪口径）+ 独立参数文件读写 |
-| `integrations/dsh-session-bridge/` | **DSH client 插件**（`dsh-session-bridge-pet`）：读 `sessions.list` 与 `uiSession.sessionStatus`，推会话状态并按时播出工资气泡文案 |
+| `integrations/dsh-pay-pet-bridge/` | **DSH client 插件**（`dsh-pay-pet-bridge`）：读 `sessions.list` 与 `uiSession.sessionStatus`，推会话状态并按时播出工资气泡文案 |
 
 ### 修改文件
 
@@ -87,7 +87,7 @@ python -m venv .venv
 .venv\Scripts\pythonw.exe -m pet
 
 # 2) DSH client 插件（装进 desktop profile）
-dsh plugin --profile desktop add <本 fork 目录>\integrations\dsh-session-bridge
+dsh plugin --profile desktop add `<本 fork>\integrations\dsh-pay-pet-bridge`
 ```
 
 装完**重启一次 DSH**（client 插件随页面加载）。
